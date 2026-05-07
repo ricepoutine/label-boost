@@ -1,0 +1,26 @@
+# Stack pinned for reproducibility with existing checkpoints and this codebase.
+# torch 2.1.x + transformers>=4.40 breaks at import (register_pytree_node needs PyTorch 2.2+).
+numpy==1.24.4
+torch==2.1.1
+torchvision==0.16.1
+scikit-learn==1.2.2
+tensorboard==2.14.1
+torchmetrics==1.4.3
+# ResNet / ViTMAE (models/resnet.py, vitmae.py). Keep tokenizers in range expected by transformers 4.38.
+transformers==4.38.2
+tokenizers>=0.14,<0.19
+pydicom
+opencv-python
+pylibjpeg
+pylibjpeg-libjpeg
+pylibjpeg-openjpeg
+seaborn
+pandas
+matplotlib
+statsmodels
+scipy
+# generate_results.py / eval scatter plots (PNG export needs kaleido).
+plotly
+kaleido
+# umap.py UMAP feature projections (figures/umap/*).
+umap-learn

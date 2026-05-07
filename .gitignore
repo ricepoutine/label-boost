@@ -1,0 +1,8 @@
+.DS_Store
+output
+datasets/
+models/MedImageInsights/2024.09.27/
+models/huggingface_cache
+**.pyc
+events.**
+**.pth.**
