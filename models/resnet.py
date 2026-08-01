@@ -26,11 +26,14 @@ class CustomResNet(nn.Module):
         self.features = self.features.to(device=device)
         self.classifier = CustomClassifier(num_classes=num_classes).to(device=device)
     
-    def forward(self, x):
+    def forward(self, x, return_logits: bool = False):
         # feature extraction (don't need middle layers, so no need to define them)
         feats = (self.features(x)).pooler_output
-        x = self.classifier(feats)
-        return torch.softmax(x, dim=1), feats #NOTE: check this, make sure it doesn't result in infinite loss lol
+        logits = self.classifier(feats)
+        probs = torch.softmax(logits, dim=1)
+        if return_logits:
+            return logits, probs, feats
+        return probs, feats
 
 if __name__ == "__main__":
     device = torch.device(device="mps")

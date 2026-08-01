@@ -10,13 +10,12 @@ chest X-ray (`Covid`) datasets.
 
 ## Top-level Scripts
 
-After cleanup, the project consists of exactly **five** top-level scripts:
-
 | Script | Purpose |
 | --- | --- |
 | [`finetune.py`](finetune.py) | ViT-MAE unsupervised reconstruction pretraining → encoder checkpoints under `output/{dataset}/lr{lr}_wd{wd}/ViTMAE/.../checkpoints/best.pth.tar`. |
 | [`probe.py`](probe.py) | Train the linear probe on top of a ViT-MAE / MII encoder. Auto-invoked by `evaluate.py`; can also run standalone. |
 | [`evaluate.py`](evaluate.py) | Train every student configuration (`ResNet18`, `ResNet18_soft`, `ResNet18_{ViTMAE,MII}_l{0.5,1.0,1.5}` ± `_ablation`) over five-fold CV and write per-fold predictions, summaries, and PHAIR metrics under `eval_output/`. |
+| [`baseline_evaluate.py`](baseline_evaluate.py) | SOTA SSL/KD baselines (FixMatch, MeanTeacher, Meta Pseudo Labels, temperature KD) under the same fold/AR/PHAIR protocol → `baseline_output/`. |
 | [`umap.py`](umap.py) | UMAP feature projections (PNG): MII untrained, ViT-MAE pretrained, ViT-MAE finetuned. |
 | [`generate_results.py`](generate_results.py) | Single entry point for every paper figure under `figures/{covid,hip}/*` and `figures/umap/*` and the calibration / DCA grids. |
 
@@ -134,6 +133,35 @@ python evaluate.py --dataset hip --experiment ResNet18_MII_l1.0 --ar 1.0 --gpu 0
 Writes per-fold predictions, summaries, and PHAIR metrics under
 `eval_output/{dataset}/{experiment}/ar{X}/`.
 
+### 2b. Train SOTA baselines (optional, for reviewer comparisons)
+
+```bash
+# Arm A (no large teacher): FixMatch hard/soft, MeanTeacher, MetaPseudoLabels
+# Arm B (same frozen teacher): KD_ViTMAE_T4, KD_MII_T4  — reuses probes from eval_output
+python baseline_evaluate.py --dataset hip   --gpu 0 --probe-root eval_output
+python baseline_evaluate.py --dataset covid --gpu 0 --probe-root eval_output
+
+# Single method / AR
+python baseline_evaluate.py --dataset hip --experiment FixMatch_hard --ar 0.5 --gpu 0
+python baseline_evaluate.py --dataset hip --experiment KD_MII_T4 --ar 0.5 \
+    --probe-root eval_output --gpu 0
+```
+
+Writes under `baseline_output/` (or `curves_baseline_output/` with curve logging)
+using the same `fold_{k}_predictions.json` / PHAIR layout as `evaluate.py`.
+
+**Fair-comparison notes** (see also the module docstring in `baseline_evaluate.py`):
+
+| Baseline | PL source | vs Label-Boost |
+| --- | --- | --- |
+| FixMatch | Same ResNet18 (weak→strong), τ=0.95 | Capacity-matched SSL; hard + soft variants |
+| MeanTeacher | EMA of student (decay 0.99) | Temporal ensemble, no large teacher |
+| MetaPseudoLabels | Co-trained ResNet18 teacher (soft) | Adaptive same-size teacher vs frozen large teacher |
+| KD_*_T4 | Same ViTMAE/MII probes as Label-Boost | Classical Hinton KD (T=4) vs T=1 soft CE |
+
+Shared: ResNet18 student, patient folds, AR grid, AdamW, 300 epochs, val-CE freeze.
+Medical-safe strong aug (no HFlip). MPL omits UDA teacher aux; last 10% epochs are labeled finetune.
+
 ### 3. Generate every paper figure
 
 ```bash
@@ -204,6 +232,10 @@ eval_output/                                         # Student-side results
         ├── aggregate_metrics.json                   # PHAIR aggregate metrics
         ├── pooled_*.png                             # PHAIR pooled plots
         └── k{k}/                                    # per-fold TensorBoard
+
+baseline_output/                                     # SSL/KD baselines (baseline_evaluate.py)
+└── {dataset}/{FixMatch_hard|MeanTeacher|...}/ar{ar}/
+    └── (same fold predictions / summary / PHAIR layout as eval_output)
 
 figures/                                             # Paper figures (this repo)
 ├── hip/<preset>/{accuracy,auroc,tables.*,significance.*}

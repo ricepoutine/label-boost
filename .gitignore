@@ -6,3 +6,7 @@ models/huggingface_cache
 **.pyc
 events.**
 **.pth.**
+.venv
+*/**/*.png
+*/**/*.json
+*/**/*.csv

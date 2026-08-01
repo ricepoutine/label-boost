@@ -1,9 +1,19 @@
 """
-evaluate.py - Clean Training + Evaluation Pipeline
+evaluate.py - Clean Training + Evaluation Pipeline (SAMPLE-TYPE updates)
+
+Identical to new_evaluate.py except for how the semi-supervised loss is applied.
+
+This file groups gradient updates *by sample*:
+    - labeled samples get a single composite step:  CE_hard + lambda * CE_soft
+    - unlabeled samples get a separate step:         lambda * CE_soft
+
+new_evaluate.py groups gradient updates *by label type* (human vs pseudo).
 
 Trains student models (with optional teacher pseudolabels) using proper
 train/validate/freeze/test protocol and generates publication-grade metrics
 via phair_eval_suite.
+
+Results are written under sample_type_output/ by default (new_evaluate uses eval_output/).
 
 Naming convention:
     {student}_{?teacher}_l{?lambda}
@@ -49,8 +59,14 @@ from probe import ensure_teacher_linear_probe, resolve_teacher_paths
 # Constants (match main.py defaults for hip experiments)
 # ---------------------------------------------------------------------------
 NUM_CLASSES = 2
-LR = 1e-3
-WD = 1e-4
+# Student training LR/WD (original defaults)
+STUDENT_LR = 1e-3
+STUDENT_WD = 1e-4
+
+# Encoder (ViTMAE) pretraining LR/WD used only to construct the encoder
+# checkpoint path (matches finetune.py defaults)
+ENCODER_LR = 1e-4
+ENCODER_WD = 1e-5
 NUM_WORKERS = 8
 TRAIN_RATIO = 0.7
 VALID_RATIO = 0.1
@@ -59,6 +75,11 @@ MODEL_SEED = 0
 K_FOLDS = 5
 DEFAULT_EPOCHS = 300
 LAMBDA_RAMP_EPOCHS = 100
+# --log-curves defaults on: student outputs go under curves_{eval_root}/ so they
+# do not mix with prior freeze-point runs. Teacher probes still load from the
+# unprefixed root by default (see resolve_output_roots). Use --no-log-curves
+# for the old freeze-point-only logging into the unprefixed root.
+CURVES_PREFIX = "curves_"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -148,7 +169,7 @@ def load_teacher(
     k: int,
     ar: float,
     device: torch.device,
-    eval_root: str = "eval_output",
+    eval_root: str = "sample_type_output",
     output_root: str = "output",
     *,
     dataset_path: Optional[str] = None,
@@ -178,8 +199,8 @@ def load_teacher(
             image_size=image_size,
             num_output_channels=num_output_channels,
             k_folds=K_FOLDS,
-            lr_for_path=LR,
-            wd_for_path=WD,
+            lr_for_path=ENCODER_LR,
+            wd_for_path=ENCODER_WD,
         )
     encoder_ckpt, probe_ckpt = resolve_teacher_paths(
         dataset_name,
@@ -189,8 +210,8 @@ def load_teacher(
         ar,
         eval_root=eval_root,
         output_root=output_root,
-        lr=LR,
-        wd=WD,
+        lr=ENCODER_LR,
+        wd=ENCODER_WD,
         train_ratio=TRAIN_RATIO,
         data_seed=DATA_SEED,
     )
@@ -237,13 +258,12 @@ def _compute_pseudolabel_accuracy(teacher, dloader_l, dloader_u, device) -> floa
     return correct / total if total > 0 else 0.0
 
 
-def _labeled_forward(model, criterion, img, lbl, teacher, lam_l, softlabels, device,
-                     ablation=False):
-    """Forward pass on a labeled batch. Returns (loss_for_backward, ce_loss_scalar).
+def _hard_loss(model, criterion, img, lbl, softlabels, device):
+    """Human (hard) label forward on a batch.
 
-    When ablation=True the teacher signal is withheld from labeled data,
-    so only the hard-label CE drives this step (teacher still trains on
-    unlabeled data via the caller).
+    Returns (ce_loss_tensor, ce_loss_scalar). When softlabels is True the hard
+    one-hot target is softened to abs(one_hot - 0.1), matching new_evaluate.py and
+    toy_example's y_train_soft = abs(y_train_hard - 0.1).
     """
     image = img.float().to(device)
     label_t = torch.unsqueeze(lbl.float(), 1).to(device)
@@ -255,30 +275,69 @@ def _labeled_forward(model, criterion, img, lbl, teacher, lam_l, softlabels, dev
     pred, _ = model(image)
     pred_log = torch.log(pred.squeeze(dim=1).clamp(min=CLS_EPS))
     ce_loss = criterion(pred_log, label_oh)
+    return ce_loss, ce_loss.item()
+
+
+def _soft_loss(model, criterion, teacher, img, device):
+    """Pseudo (teacher soft) label loss on a batch.
+
+    Returns (soft_loss_tensor, batch_size).
+    """
+    image = img.float().to(device)
+    pred, _ = model(image)
+    pred_log = torch.log(pred.squeeze(dim=1).clamp(min=CLS_EPS))
+    with torch.no_grad():
+        soft, _ = teacher(image)
+    return criterion(pred_log, soft), image.size(0)
+
+
+def _labeled_forward(model, criterion, img, lbl, teacher, lam_l, softlabels, device,
+                     ablation=False):
+    """Sample-type labeled forward: CE_hard + lambda * CE_soft in one loss.
+
+    When ablation=True the teacher signal is withheld from labeled data,
+    so only the hard-label CE drives this step (teacher still trains on
+    unlabeled data via the caller).
+
+    Returns (loss_for_backward, hard_ce_scalar, soft_ce_scalar_or_None).
+    """
+    hard_loss, ce = _hard_loss(model, criterion, img, lbl, softlabels, device)
 
     if teacher is not None and lam_l > 0 and not ablation:
-        with torch.no_grad():
-            soft, _ = teacher(image)
-        soft_ce = criterion(pred_log, soft)
-        loss = ce_loss + lam_l * soft_ce
-    else:
-        loss = ce_loss
-
-    return loss, ce_loss.item()
+        soft_loss, _ = _soft_loss(model, criterion, teacher, img, device)
+        loss = hard_loss + lam_l * soft_loss
+        return loss, ce, soft_loss.item()
+    return hard_loss, ce, None
 
 
 def train_epoch(model, optimizer, criterion, dloader_l, dloader_u,
-                teacher, lam_l, lam_u, softlabels, device, ablation=False):
-    """One training epoch. Returns average CE loss on labeled data."""
+                teacher, lam_l, lam_u, softlabels, device, ablation=False,
+                track_components: bool = False) -> dict:
+    """One training epoch using SAMPLE-TYPE updates.
+
+    Updates are grouped by *sample* rather than by label type:
+
+      Labeled samples  One step: backward(CE_hard + lambda * CE_soft), then step.
+      Unlabeled samples  Separate step: backward(lambda * CE_soft), then step.
+
+    Under ablation the teacher signal is withheld from labeled data; unlabeled
+    pseudo-label updates are unchanged.
+
+    Returns dict with hard_ce and, when track_components=True, soft_ce_l / soft_ce_u.
+    """
     model.train()
     ce_total = 0.0
     n = 0
+    soft_l_total = 0.0
+    soft_l_n = 0
+    soft_u_total = 0.0
+    soft_u_n = 0
 
     if dloader_u is None:
-        # ar = 1.0: all data is labeled
+        # ar = 1.0: every sample carries both a hard and a pseudo label.
         for img, lbl, _ in dloader_l:
             optimizer.zero_grad()
-            loss, ce = _labeled_forward(
+            loss, ce, soft_ce = _labeled_forward(
                 model, criterion, img, lbl, teacher, lam_l, softlabels, device,
                 ablation=ablation,
             )
@@ -286,8 +345,11 @@ def train_epoch(model, optimizer, criterion, dloader_l, dloader_u,
             optimizer.step()
             ce_total += ce
             n += 1
+            if track_components and soft_ce is not None:
+                soft_l_total += soft_ce
+                soft_l_n += 1
     else:
-        # ar < 1.0: interleaved labeled + unlabeled (matches main.py indep approach)
+        # ar < 1.0: interleaved labeled + unlabeled (same pairing as new_evaluate.py).
         if len(dloader_l.dataset) >= len(dloader_u.dataset):
             outer, inner, outer_labeled = dloader_l, dloader_u, True
         else:
@@ -305,50 +367,98 @@ def train_epoch(model, optimizer, criterion, dloader_l, dloader_u,
 
             # Step 1: labeled update (ablation skips teacher here)
             optimizer.zero_grad()
-            loss, ce = _labeled_forward(
+            loss, ce, soft_ce = _labeled_forward(
                 model, criterion, l_batch[0], l_batch[1],
                 teacher, lam_l, softlabels, device,
                 ablation=ablation,
             )
             loss.backward()
             optimizer.step()
-            optimizer.zero_grad()
 
             # Step 2: unlabeled update
             if teacher is not None and lam_u > 0:
-                img_u = u_batch[0].float().to(device)
-                pred, _ = model(img_u)
-                pred_log = torch.log(pred.squeeze(dim=1).clamp(min=CLS_EPS))
-                with torch.no_grad():
-                    soft_u, _ = teacher(img_u)
-                loss_u = lam_u * criterion(pred_log, soft_u)
-                loss_u.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                soft_loss, _ = _soft_loss(
+                    model, criterion, teacher, u_batch[0], device,
+                )
+                (lam_u * soft_loss).backward()
+                optimizer.step()
+                if track_components:
+                    soft_u_total += soft_loss.item()
+                    soft_u_n += 1
 
             ce_total += ce
             n += 1
+            if track_components and soft_ce is not None:
+                soft_l_total += soft_ce
+                soft_l_n += 1
 
-    return ce_total / max(n, 1)
+    out = {"hard_ce": ce_total / max(n, 1)}
+    if track_components:
+        out["soft_ce_l"] = soft_l_total / soft_l_n if soft_l_n else None
+        out["soft_ce_u"] = soft_u_total / soft_u_n if soft_u_n else None
+    return out
 
 
-def validate(model, criterion, dloader, softlabels, device) -> float:
-    """Returns average CE loss on validation set."""
+def validate(model, criterion, dloader, softlabels, device,
+             with_metrics: bool = False):
+    """Validation CE; optionally also top-1 and AUROC in the same pass.
+
+    Returns float CE when with_metrics=False, else dict with ce/top1/auroc.
+    """
+    auroc_metric = BinaryAUROC() if with_metrics else None
     model.eval()
     total = 0.0
     n = 0
+    all_y_true: list[float] = []
+    all_y_prob: list[float] = []
+    all_pred_log: list[torch.Tensor] = []
+    all_label_oh: list[torch.Tensor] = []
+
     with torch.no_grad():
         for img, lbl, _ in dloader:
             image = img.float().to(device)
             label_t = torch.unsqueeze(lbl.float(), 1).to(device)
             label_oh = torch.zeros(label_t.size(0), NUM_CLASSES, device=device)
             label_oh.scatter_(1, label_t.long().view(-1, 1), 1)
-            if softlabels:
-                label_oh = abs(label_oh - 0.1)
+            label_oh_ce = abs(label_oh - 0.1) if softlabels else label_oh
             pred, _ = model(image)
             pred_log = torch.log(pred.squeeze(dim=1).clamp(min=CLS_EPS))
-            total += criterion(pred_log, label_oh).item()
+            total += criterion(pred_log, label_oh_ce).item()
             n += 1
-    return total / max(n, 1)
+            if with_metrics:
+                all_y_prob.extend(pred[:, 1].detach().cpu().tolist())
+                all_y_true.extend(lbl.float().tolist())
+                all_pred_log.append(pred_log.cpu())
+                all_label_oh.append(label_oh.cpu())
+
+    ce = total / max(n, 1)
+    if not with_metrics:
+        return ce
+
+    auc = float(auroc_metric(tensor(all_y_prob), tensor(all_y_true)).item())
+    score_t = torch.cat(all_pred_log, dim=0)
+    label_t = torch.cat(all_label_oh, dim=0)
+    _, y_true_idx = torch.topk(label_t, k=1, dim=1)
+    _, y_pred_idx = torch.topk(score_t, k=NUM_CLASSES, dim=1)
+    top1 = float(torch.sum(y_true_idx == y_pred_idx[:, :1]).item()) / y_true_idx.size(0)
+    return {"ce": ce, "top1": top1, "auroc": auc}
+
+
+def resolve_output_roots(eval_root: str, log_curves: bool,
+                         probe_root: Optional[str] = None) -> tuple[str, str]:
+    """Return (student_eval_root, probe_root).
+
+    With log_curves, student outputs are written under curves_{eval_root}/.
+    Teacher probes default to the unprefixed eval_root so existing probes are reused.
+    """
+    if log_curves:
+        student_root = (
+            eval_root if eval_root.startswith(CURVES_PREFIX)
+            else f"{CURVES_PREFIX}{eval_root}"
+        )
+        return student_root, (probe_root if probe_root is not None else eval_root)
+    return eval_root, (probe_root if probe_root is not None else eval_root)
 
 # ---------------------------------------------------------------------------
 # Test evaluation
@@ -409,10 +519,17 @@ def run_fold(
     eval_root: str,
     output_root: str,
     num_workers: int = NUM_WORKERS,
+    log_curves: bool = True,
+    probe_root: Optional[str] = None,
 ) -> dict:
-    """Train one fold, freeze at best val loss, evaluate test set once."""
+    """Train one fold, freeze at best val loss, evaluate test set once.
+
+    When log_curves=True (default), also logs per-epoch val top-1/AUROC and
+    train soft CE components (validation only — test remains freeze-point).
+    """
     ar_dir = Path(eval_root) / preset.dataset_name / experiment.name / f"ar{ar}"
     ar_dir.mkdir(parents=True, exist_ok=True)
+    teacher_eval_root = probe_root if probe_root is not None else eval_root
 
     # -- Data (same seeds and splits as main.py) --
     ssl = (ar != 1.0)
@@ -456,7 +573,7 @@ def run_fold(
             k,
             ar,
             device,
-            eval_root=eval_root,
+            eval_root=teacher_eval_root,
             output_root=output_root,
             dataset_path=dataset_path,
             class_sizes=list(preset.class_sizes),
@@ -478,7 +595,9 @@ def run_fold(
         pretrained=False,
         device=device,
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=STUDENT_LR, weight_decay=STUDENT_WD,
+    )
     criterion = ClsCriterion()
 
     # -- TensorBoard logger (one per fold, matching main.py) --
@@ -492,18 +611,39 @@ def run_fold(
     for epoch in range(epochs):
         lam = alpha_schedule(0, epoch, LAMBDA_RAMP_EPOCHS, experiment.lam) if experiment.teacher else 0.0
 
-        train_ce = train_epoch(
+        train_stats = train_epoch(
             model, optimizer, criterion,
             dloader_l, dloader_u, teacher,
             lam_l=lam, lam_u=lam,
             softlabels=experiment.softlabels,
             device=device,
             ablation=experiment.ablation,
+            track_components=log_curves,
         )
-        val_loss = validate(model, criterion, valid_dloader, experiment.softlabels, device)
+        train_ce = train_stats["hard_ce"]
+        val_out = validate(
+            model, criterion, valid_dloader, experiment.softlabels, device,
+            with_metrics=log_curves,
+        )
+        if log_curves:
+            val_loss = val_out["ce"]
+        else:
+            val_loss = val_out
 
         logger.add_scalar("Train/CE Loss", train_ce, epoch + 1)
         logger.add_scalar("Valid/CE Losses", val_loss, epoch + 1)
+        if log_curves:
+            logger.add_scalar("Train/Lambda", lam, epoch + 1)
+            if train_stats.get("soft_ce_l") is not None:
+                logger.add_scalar(
+                    "Train/Soft CE Labeled", train_stats["soft_ce_l"], epoch + 1,
+                )
+            if train_stats.get("soft_ce_u") is not None:
+                logger.add_scalar(
+                    "Train/Soft CE Unlabeled", train_stats["soft_ce_u"], epoch + 1,
+                )
+            logger.add_scalar("Valid/Top 1 accuracy", val_out["top1"], epoch + 1)
+            logger.add_scalar("Valid/AUROC", val_out["auroc"], epoch + 1)
 
         if math.isfinite(val_loss) and val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -518,9 +658,12 @@ def run_fold(
         if (epoch + 1) % 50 == 0 or epoch == 0:
             val_str = f"{val_loss:.4f}" if math.isfinite(val_loss) else str(val_loss)
             train_str = f"{train_ce:.4f}" if math.isfinite(train_ce) else str(train_ce)
+            extra = ""
+            if log_curves:
+                extra = f"  val_top1={val_out['top1']:.4f}  val_auroc={val_out['auroc']:.4f}"
             print(f"  [k={k}] epoch {epoch+1:>3}/{epochs}"
                   f"  train_ce={train_str}  val_ce={val_str}"
-                  f"  best@{best_epoch+1}")
+                  f"  best@{best_epoch+1}{extra}")
 
     # -- Load best checkpoint and evaluate test set --
     ckpt_path = ar_dir / "checkpoints" / f"k{k}_best.pth.tar"
@@ -540,6 +683,8 @@ def run_fold(
 
     logger.add_scalar("Test/Top 1 accuracy", results["top1"], 1)
     logger.add_scalar("Test/AUROC", results["auroc"], 1)
+    if log_curves:
+        logger.add_scalar("Train/Best Epoch", best_epoch + 1, 1)
 
     logger.flush()
     logger.close()
@@ -562,16 +707,22 @@ def run_experiment(
     ar_list: list[float],
     device: torch.device,
     epochs: int = DEFAULT_EPOCHS,
-    eval_root: str = "eval_output",
+    eval_root: str = "sample_type_output",
     output_root: str = "output",
     num_workers: int = NUM_WORKERS,
+    log_curves: bool = True,
+    probe_root: Optional[str] = None,
 ):
     print(f"\n{'='*60}")
     print(f"Experiment: {experiment.name}  |  Dataset: {preset.dataset_name}")
     print(f"Teacher: {experiment.teacher or 'None'}  |  lambda: {experiment.lam}"
           f"  |  softlabels: {experiment.softlabels}"
           f"  |  ablation: {experiment.ablation}")
-    print(f"Epochs: {epochs}  |  Device: {device}")
+    print(f"Epochs: {epochs}  |  Device: {device}"
+          f"  |  log_curves: {log_curves}"
+          f"  |  eval_root: {eval_root}")
+    if probe_root is not None and probe_root != eval_root:
+        print(f"Probe root: {probe_root}")
     print(f"{'='*60}")
 
     cross_ar_rows: list[dict] = []
@@ -584,6 +735,8 @@ def run_experiment(
             res = run_fold(
                 preset, experiment, ar, k, device, epochs, eval_root, output_root,
                 num_workers=num_workers,
+                log_curves=log_curves,
+                probe_root=probe_root,
             )
             fold_results.append({
                 "k": k, "top1": res["top1"], "auroc": res["auroc"],
@@ -693,7 +846,7 @@ def parse_ar_list(s: str) -> list[float]:
 def main_cli():
     parser = argparse.ArgumentParser(
         description="Train and evaluate student models with proper "
-                    "train/validate/freeze/test protocol.",
+                    "train/validate/freeze/test protocol (sample-type updates).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -703,6 +856,10 @@ Examples:
   python evaluate.py --dataset hip --experiment ResNet18_ViTMAE_l1.0 --gpu 2,3
   python evaluate.py --dataset hip
   python evaluate.py --dataset covid --experiment ResNet18_MII_l1.0 --ar 1.0 --gpu 0
+  python evaluate.py --dataset hip --experiment ResNet18_ViTMAE_l1.0 --ar 0.1,0.5,1.0 \\
+      --probe-root eval_output --gpu 0
+  python evaluate.py --dataset hip --experiment ResNet18_soft --ar 0.1,0.5,1.0 --gpu 0
+  python evaluate.py --dataset hip --experiment ResNet18 --ar 1.0 --no-log-curves --gpu 0
 """,
     )
     parser.add_argument(
@@ -720,12 +877,27 @@ Examples:
              "0.5,0.6,0.7,0.8,0.9,1.0 (omit for full sweep 0.1-1.0)",
     )
     parser.add_argument(
-        "--eval-root", default="eval_output",
-        help="Output root directory (default: eval_output)",
+        "--eval-root", default="sample_type_output",
+        help="Output root directory (default: sample_type_output). "
+             "With log-curves (default) this becomes curves_{eval-root}.",
     )
     parser.add_argument(
         "--output-root", default="output",
         help="Training output root for teacher checkpoints (default: output)",
+    )
+    parser.add_argument(
+        "--log-curves", dest="log_curves", action="store_true", default=True,
+        help="Log per-epoch val top-1/AUROC and train soft CE; write under "
+             "curves_{eval-root}/ (default: on). Test remains freeze-point only.",
+    )
+    parser.add_argument(
+        "--no-log-curves", dest="log_curves", action="store_false",
+        help="Disable curve logging; write to unprefixed --eval-root.",
+    )
+    parser.add_argument(
+        "--probe-root", default=None,
+        help="Root for teacher linear probes (default: unprefixed --eval-root). "
+             "Use e.g. eval_output to reuse probes from prior label-type runs.",
     )
     parser.add_argument(
         "--device", default=None,
@@ -766,17 +938,24 @@ Examples:
     else:
         experiments = list(EXPERIMENTS.values())
 
+    eval_root, probe_root = resolve_output_roots(
+        args.eval_root, args.log_curves, args.probe_root,
+    )
+
     print(f"Device: {device}")
     print(f"Experiments: {[e.name for e in experiments]}")
     print(f"Annotation ratios: {ar_list}")
+    print(f"eval_root: {eval_root}  probe_root: {probe_root}  log_curves: {args.log_curves}")
 
     for exp in experiments:
         run_experiment(
             preset, exp, ar_list, device,
             epochs=args.epochs,
-            eval_root=args.eval_root,
+            eval_root=eval_root,
             output_root=args.output_root,
             num_workers=args.num_workers,
+            log_curves=args.log_curves,
+            probe_root=probe_root,
         )
 
 

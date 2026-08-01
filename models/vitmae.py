@@ -40,18 +40,18 @@ class CustomNonLinearClassifier(nn.Sequential):
 class CustomViTMAE(nn.Module):
     def __init__(self, num_classes, vitmae_checkpoint_path, linear=True, classifier_checkpoint_path=None, device=torch.device(device='cuda')):
         super().__init__()
-        self.device = device # double check map_location is not keeping them in cpu forever...
+        self.device=device # double check map_location is not keeping them in cpu forever...
         self.linear = linear
-        vitmae = ViTMAEForPreTraining.from_pretrained("facebook/vit-mae-large")
-        pretrained_weights = torch.load(vitmae_checkpoint_path, map_location=device) # must be pretrained
+        vitmae = ViTMAEForPreTraining.from_pretrained("facebook/vit-mae-large", cache_dir='./models/huggingface_cache')
+        pretrained_weights = torch.load(vitmae_checkpoint_path) # must be pretrained
         vitmae.load_state_dict(pretrained_weights['state_dict'])
         self.features = vitmae
         self.features = self.features.to(device=device)
         self.features.eval()
         if linear: self.classifier = CustomLinearClassifier(num_classes=num_classes, in_features=1024).to(device=device)
-        else: self.classifier = CustomNonLinearClassifier(num_classes=num_classes, in_features=(50,1024)).to(device)
+        else: self.classifier = CustomNonLinearClassifier(num_classes=num_classes, in_features=(50, 1024)).to(device)
         if classifier_checkpoint_path is not None: # load pretrained linear weights
-            self.classifier.load_state_dict(torch.load(classifier_checkpoint_path, map_location=device)['state_dict'])
+            self.classifier.load_state_dict(torch.load(classifier_checkpoint_path)['state_dict'])
             self.classifier = self.classifier.to(device=device)
     
     def forward(self, x):

@@ -17,7 +17,7 @@ class CustomClassifier(nn.Sequential):
         self.add_module("1", nn.Linear(in_features=1024, out_features=num_classes, bias=True))
 
 class CustomMII(nn.Module):
-    def __init__(self, num_classes, classifier_checkpoint_path=None, device=torch.device(device='mps')):
+    def __init__(self, num_classes, classifier_checkpoint_path=None, device=torch.device(device='cuda')):
         super().__init__()
         self.device = device
         MII_path = Path.cwd() / 'models' / 'MedImageInsights'
@@ -28,7 +28,7 @@ class CustomMII(nn.Module):
         self.features.load_model()
         self.classifier = CustomClassifier(num_classes=num_classes).to(device=self.device)
         if classifier_checkpoint_path is not None:
-            self.classifier.load_state_dict(torch.load(classifier_checkpoint_path, map_location=self.device)['state_dict'])
+            self.classifier.load_state_dict(torch.load(classifier_checkpoint_path)['state_dict'])
         self.classifier = self.classifier.to(device=self.device)
 
     def get_image_embeddings(self, image, norm=False):
