@@ -20,12 +20,21 @@ sample, exactly as toy_example does with
 Because ClsCriterion is mean-reduced, this weighted combination is equal to a
 single forward over the concatenated labeled+unlabeled set.
 
+``update`` selects the schedule. ``label_two`` (the default) is the two steps
+above. ``label_one`` puts that same pooled objective in one backward.
+``sample`` is hard plus the teacher term on the labeled batch, then a separate
+teacher step on unlabeled data. ``temperature`` defaults to 1, which keeps soft
+CE on the teacher's probabilities. Any other temperature replaces that teacher
+term with Hinton's T^2 KL. The hard-label term is never temperature-scaled.
+Lambda still ramps with the usual alpha schedule.
+
 Naming convention:
     {student}_{?teacher}_l{?lambda}
     e.g. ResNet18, ResNet18_soft, ResNet18_ViTMAE_l1.0, ResNet18_MII_l1.0
 
 Usage:
     python new_evaluate.py --dataset hip --experiment ResNet18_ViTMAE_l1.0 --ar 1.0
+    python new_evaluate.py --dataset hip --experiment ResNet18_ViTMAE_l1.0_T4
     python new_evaluate.py --dataset hip --experiment ResNet18_MII_l1.0 --ar 0.5,0.6,0.7,0.8,0.9,1.0
     python new_evaluate.py --dataset hip --experiment ResNet18_ViTMAE_l1.0
     python new_evaluate.py --dataset hip
@@ -51,8 +60,9 @@ from torch import tensor
 from torchmetrics.classification import BinaryAUROC
 
 from torch.utils.tensorboard import SummaryWriter
+from lib.baselines.losses import kd_loss
 from lib.criterion import ClsCriterion, eps as CLS_EPS
-from lib.dataloader import create_dataloaders
+from lib.dataloader import create_dataloaders, paired_batches
 from lib.utils.model_utils import save_checkpoint, alpha_schedule
 from models.resnet import CustomResNet
 from models.vitmae import CustomViTMAE
@@ -80,6 +90,8 @@ MODEL_SEED = 0
 K_FOLDS = 5
 DEFAULT_EPOCHS = 300
 LAMBDA_RAMP_EPOCHS = 100
+# Hinton temperature. 1.0 keeps the label-boost soft-CE teacher term.
+KD_TEMPERATURE = 4.0
 # --log-curves defaults on: student outputs go under curves_{eval_root}/ so they
 # do not mix with prior freeze-point runs. Teacher probes still load from the
 # unprefixed root by default (see resolve_output_roots). Use --no-log-curves
@@ -112,6 +124,26 @@ class Experiment:
     lam: float = 1.0
     softlabels: bool = False
     ablation: bool = False
+    # True: step on human labels, then step on the teacher signal.
+    # False: sample-type schedule, used only when ``update`` is left unset.
+    two_step: bool = True
+    # label_two: hard step, then one pooled teacher step (default label-boost).
+    # label_one: one step of hard loss plus the pooled teacher loss.
+    # sample: hard+teacher on labeled data, then teacher on unlabeled data.
+    # None follows ``two_step`` (True -> label_two, False -> sample).
+    update: Optional[str] = None
+    # 1.0: soft CE against the teacher's probabilities.
+    # Otherwise: Hinton T^2 KL with logits divided by this temperature.
+    temperature: float = 1.0
+    # Teacher head to load. Temperature runs reuse the λ=1.0 probes.
+    probe_experiment: Optional[str] = None
+
+
+def resolve_update(experiment: Experiment) -> str:
+    """Return label_two, label_one, or sample."""
+    if experiment.update is not None:
+        return experiment.update
+    return "label_two" if experiment.two_step else "sample"
 
 
 EXPERIMENTS: dict[str, Experiment] = {
@@ -125,6 +157,55 @@ EXPERIMENTS: dict[str, Experiment] = {
     "ResNet18_MII_l1.0": Experiment("ResNet18_MII_l1.0", teacher="MII", lam=1.0),
     "ResNet18_MII_l1.5": Experiment("ResNet18_MII_l1.5", teacher="MII", lam=1.5),
     "ResNet18_MII_l1.0_ablation": Experiment("ResNet18_MII_l1.0_ablation", teacher="MII", lam=1.0, ablation=True),
+    # One step of the label-type objective. T=1 is soft CE.
+    "ResNet18_ViTMAE_l1.0_1step": Experiment(
+        "ResNet18_ViTMAE_l1.0_1step",
+        teacher="ViTMAE",
+        lam=1.0,
+        update="label_one",
+        probe_experiment="ResNet18_ViTMAE_l1.0",
+    ),
+    "ResNet18_MII_l1.0_1step": Experiment(
+        "ResNet18_MII_l1.0_1step",
+        teacher="MII",
+        lam=1.0,
+        update="label_one",
+        probe_experiment="ResNet18_MII_l1.0",
+    ),
+    # Same one step, with Hinton temperature on the pooled teacher term.
+    "ResNet18_ViTMAE_l1.0_1step_T4": Experiment(
+        "ResNet18_ViTMAE_l1.0_1step_T4",
+        teacher="ViTMAE",
+        lam=1.0,
+        update="label_one",
+        temperature=KD_TEMPERATURE,
+        probe_experiment="ResNet18_ViTMAE_l1.0",
+    ),
+    "ResNet18_MII_l1.0_1step_T4": Experiment(
+        "ResNet18_MII_l1.0_1step_T4",
+        teacher="MII",
+        lam=1.0,
+        update="label_one",
+        temperature=KD_TEMPERATURE,
+        probe_experiment="ResNet18_MII_l1.0",
+    ),
+    # Two-step label-type split at T=4. The T=1 cell is ResNet18_*_l1.0.
+    "ResNet18_ViTMAE_l1.0_T4": Experiment(
+        "ResNet18_ViTMAE_l1.0_T4",
+        teacher="ViTMAE",
+        lam=1.0,
+        update="label_two",
+        temperature=KD_TEMPERATURE,
+        probe_experiment="ResNet18_ViTMAE_l1.0",
+    ),
+    "ResNet18_MII_l1.0_T4": Experiment(
+        "ResNet18_MII_l1.0_T4",
+        teacher="MII",
+        lam=1.0,
+        update="label_two",
+        temperature=KD_TEMPERATURE,
+        probe_experiment="ResNet18_MII_l1.0",
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -283,40 +364,66 @@ def _hard_loss(model, criterion, img, lbl, softlabels, device):
     return ce_loss, ce_loss.item()
 
 
-def _soft_loss(model, criterion, teacher, img, device):
-    """Pseudo (teacher soft) label loss on a batch.
+def _soft_loss(model, criterion, teacher, img, device, temperature: float = 1.0):
+    """Teacher-signal loss on a batch.
 
-    Returns (soft_loss_tensor, batch_size). The batch_size is used to reconstruct
-    a sample-count-weighted mean across labeled + unlabeled batches.
+    ``temperature == 1`` is label-boost soft CE against the teacher's
+    probabilities. Any other temperature is Hinton KD: T^2 * KL between
+    softmax(student_logits / T) and softmax(teacher_logits / T).
+
+    Returns (loss_tensor, batch_size). The batch_size reconstructs a
+    sample-count-weighted mean across labeled and unlabeled batches.
     """
     image = img.float().to(device)
-    pred, _ = model(image)
-    pred_log = torch.log(pred.squeeze(dim=1).clamp(min=CLS_EPS))
+    if math.isclose(temperature, 1.0):
+        pred, _ = model(image)
+        pred_log = torch.log(pred.squeeze(dim=1).clamp(min=CLS_EPS))
+        with torch.no_grad():
+            soft, _ = teacher(image)
+        return criterion(pred_log, soft), image.size(0)
+
+    logits, _, _ = model(image, return_logits=True)
     with torch.no_grad():
-        soft, _ = teacher(image)
-    return criterion(pred_log, soft), image.size(0)
+        t_probs, _ = teacher(image)
+    return kd_loss(logits, t_probs, temperature), image.size(0)
 
 
 def train_epoch(model, optimizer, criterion, dloader_l, dloader_u,
                 teacher, lam_l, lam_u, softlabels, device, ablation=False,
-                track_components: bool = False) -> dict:
-    """One training epoch using LABEL-TYPE updates.
+                track_components: bool = False, two_step: bool = True,
+                temperature: float = 1.0, update: Optional[str] = None) -> dict:
+    """One training epoch.
 
-    Updates are grouped by the *type* of label rather than by sample:
+    ``update="label_two"`` (label-boost default) groups updates by label type:
 
       Step 1  All human (hard) labels update together:
               backward(CE_hard) over labeled data, then step.
 
-      Step 2  All pseudo (teacher soft) labels update together:
-              backward(lambda * CE_soft) aggregated over *all* data
+      Step 2  All teacher labels update together:
+              backward(lambda * teacher_loss) aggregated over *all* data
               (labeled + unlabeled) as a single sample-count-weighted mean,
               then step. This mirrors toy_example.fit_by_label_type STEP 2.
 
-    Under ablation the teacher signal is withheld from labeled data, so Step 2
-    covers unlabeled data only (Step 1 is unchanged).
+    ``update="label_one"`` is that same objective in one backward:
+    CE_hard on the labeled batch plus lambda times the pooled teacher loss
+    over the labeled and unlabeled batches, then one step.
+
+    ``update="sample"`` puts CE_hard + lambda * teacher_loss on the labeled
+    batch in one step, then takes a separate teacher step on unlabeled data.
+    That is the sample-type schedule, and it is the shape of one-step KD.
+
+    ``temperature == 1`` keeps soft CE on the teacher probabilities.
+    Otherwise the teacher term is Hinton's temperature-scaled KL. The hard
+    label is never temperature-scaled.
+
+    Under ablation the teacher signal is withheld from labeled data.
 
     Returns dict with hard_ce and, when track_components=True, soft_ce_l / soft_ce_u.
     """
+    if update is None:
+        update = "label_two" if two_step else "sample"
+    if update not in ("label_two", "label_one", "sample"):
+        raise ValueError(f"Unknown update mode: {update}")
     model.train()
     ce_total = 0.0
     n = 0
@@ -325,80 +432,129 @@ def train_epoch(model, optimizer, criterion, dloader_l, dloader_u,
     soft_u_total = 0.0
     soft_u_n = 0
 
+    def _note_soft(value, labeled: bool) -> None:
+        nonlocal soft_l_total, soft_l_n, soft_u_total, soft_u_n
+        if not track_components:
+            return
+        if labeled:
+            soft_l_total += value
+            soft_l_n += 1
+        else:
+            soft_u_total += value
+            soft_u_n += 1
+
+    def _combined_labeled(img, lbl):
+        """One step on CE_hard + lambda * teacher loss."""
+        optimizer.zero_grad()
+        hard_loss, ce = _hard_loss(model, criterion, img, lbl, softlabels, device)
+        if teacher is not None and lam_l > 0 and not ablation:
+            soft_loss, _ = _soft_loss(
+                model, criterion, teacher, img, device, temperature,
+            )
+            (hard_loss + lam_l * soft_loss).backward()
+            optimizer.step()
+            _note_soft(soft_loss.item(), labeled=True)
+        else:
+            hard_loss.backward()
+            optimizer.step()
+        return ce
+
     if dloader_u is None:
         # ar = 1.0: every sample carries both a hard and a pseudo label.
         for img, lbl, _ in dloader_l:
-            # Step 1: human (hard) label update
-            optimizer.zero_grad()
-            hard_loss, ce = _hard_loss(model, criterion, img, lbl, softlabels, device)
-            hard_loss.backward()
-            optimizer.step()
-
-            # Step 2: pseudo (teacher soft) label update over all data
-            if teacher is not None and lam_l > 0 and not ablation:
+            if update == "label_two":
+                # Step 1: human (hard) label update
                 optimizer.zero_grad()
-                soft_loss, _ = _soft_loss(model, criterion, teacher, img, device)
-                (lam_l * soft_loss).backward()
+                hard_loss, ce = _hard_loss(model, criterion, img, lbl, softlabels, device)
+                hard_loss.backward()
                 optimizer.step()
-                if track_components:
-                    soft_l_total += soft_loss.item()
-                    soft_l_n += 1
+
+                # Step 2: teacher-label update over all data
+                if teacher is not None and lam_l > 0 and not ablation:
+                    optimizer.zero_grad()
+                    soft_loss, _ = _soft_loss(
+                        model, criterion, teacher, img, device, temperature,
+                    )
+                    (lam_l * soft_loss).backward()
+                    optimizer.step()
+                    _note_soft(soft_loss.item(), labeled=True)
+            else:
+                # label_one and sample agree when every sample is labeled.
+                ce = _combined_labeled(img, lbl)
 
             ce_total += ce
             n += 1
     else:
-        # ar < 1.0: interleaved labeled + unlabeled (same pairing as evaluate.py).
-        if len(dloader_l.dataset) >= len(dloader_u.dataset):
-            outer, inner, outer_labeled = dloader_l, dloader_u, True
-        else:
-            outer, inner, outer_labeled = dloader_u, dloader_l, False
-
-        inner_iter = iter(inner)
-        for outer_batch in outer:
-            try:
-                inner_batch = next(inner_iter)
-            except StopIteration:
-                break
-
-            l_batch = outer_batch if outer_labeled else inner_batch
-            u_batch = inner_batch if outer_labeled else outer_batch
-
-            # Step 1: human (hard) label update on labeled data only
-            optimizer.zero_grad()
-            hard_loss, ce = _hard_loss(
-                model, criterion, l_batch[0], l_batch[1], softlabels, device,
-            )
-            hard_loss.backward()
-            optimizer.step()
-
-            # Step 2: pseudo (teacher soft) label update, aggregated over all data
-            if teacher is not None and lam_u > 0:
+        # ar < 1.0: one labeled batch paired with one unlabeled batch.
+        for l_batch, u_batch in paired_batches(dloader_l, dloader_u):
+            if update == "label_one":
+                # One backward of the label-type objective.
                 optimizer.zero_grad()
-                # Unlabeled samples always contribute to the pseudo-label update.
-                soft_loss_u, n_u = _soft_loss(
-                    model, criterion, teacher, u_batch[0], device,
+                hard_loss, ce = _hard_loss(
+                    model, criterion, l_batch[0], l_batch[1], softlabels, device,
                 )
-                if not ablation:
-                    # Labeled samples also contribute their pseudo-label loss;
-                    # combine as a sample-count-weighted mean so the result equals
-                    # a single mean over the concatenated labeled+unlabeled set.
-                    soft_loss_l, n_l = _soft_loss(
-                        model, criterion, teacher, l_batch[0], device,
+                if teacher is not None and lam_u > 0:
+                    soft_loss_u, n_u = _soft_loss(
+                        model, criterion, teacher, u_batch[0], device, temperature,
                     )
-                    soft_loss = (soft_loss_l * n_l + soft_loss_u * n_u) / (n_l + n_u)
-                    if track_components:
-                        soft_l_total += soft_loss_l.item()
-                        soft_l_n += 1
-                        soft_u_total += soft_loss_u.item()
-                        soft_u_n += 1
+                    if not ablation:
+                        soft_loss_l, n_l = _soft_loss(
+                            model, criterion, teacher, l_batch[0], device, temperature,
+                        )
+                        soft_loss = (soft_loss_l * n_l + soft_loss_u * n_u) / (n_l + n_u)
+                        _note_soft(soft_loss_l.item(), labeled=True)
+                        _note_soft(soft_loss_u.item(), labeled=False)
+                    else:
+                        soft_loss = soft_loss_u
+                        _note_soft(soft_loss_u.item(), labeled=False)
+                    (hard_loss + lam_u * soft_loss).backward()
                 else:
-                    # Ablation: teacher signal withheld from labeled data.
-                    soft_loss = soft_loss_u
-                    if track_components:
-                        soft_u_total += soft_loss_u.item()
-                        soft_u_n += 1
-                (lam_u * soft_loss).backward()
+                    hard_loss.backward()
                 optimizer.step()
+            elif update == "label_two":
+                # Step 1: human (hard) label update on labeled data only
+                optimizer.zero_grad()
+                hard_loss, ce = _hard_loss(
+                    model, criterion, l_batch[0], l_batch[1], softlabels, device,
+                )
+                hard_loss.backward()
+                optimizer.step()
+
+                # Step 2: teacher-label update, aggregated over all data
+                if teacher is not None and lam_u > 0:
+                    optimizer.zero_grad()
+                    # Unlabeled samples always contribute to the teacher update.
+                    soft_loss_u, n_u = _soft_loss(
+                        model, criterion, teacher, u_batch[0], device, temperature,
+                    )
+                    if not ablation:
+                        # Labeled samples also contribute; combine as a
+                        # sample-count-weighted mean so the result equals a
+                        # single mean over the concatenated set.
+                        soft_loss_l, n_l = _soft_loss(
+                            model, criterion, teacher, l_batch[0], device, temperature,
+                        )
+                        soft_loss = (soft_loss_l * n_l + soft_loss_u * n_u) / (n_l + n_u)
+                        _note_soft(soft_loss_l.item(), labeled=True)
+                        _note_soft(soft_loss_u.item(), labeled=False)
+                    else:
+                        # Ablation: teacher signal withheld from labeled data.
+                        soft_loss = soft_loss_u
+                        _note_soft(soft_loss_u.item(), labeled=False)
+                    (lam_u * soft_loss).backward()
+                    optimizer.step()
+            elif update == "sample":
+                ce = _combined_labeled(l_batch[0], l_batch[1])
+                if teacher is not None and lam_u > 0:
+                    optimizer.zero_grad()
+                    soft_loss_u, _ = _soft_loss(
+                        model, criterion, teacher, u_batch[0], device, temperature,
+                    )
+                    (lam_u * soft_loss_u).backward()
+                    optimizer.step()
+                    _note_soft(soft_loss_u.item(), labeled=False)
+            else:
+                raise ValueError(f"Unknown update mode: {update}")
 
             ce_total += ce
             n += 1
@@ -579,7 +735,7 @@ def run_fold(
         teacher = load_teacher(
             experiment.teacher,
             preset.dataset_name,
-            experiment.name,
+            experiment.probe_experiment or experiment.name,
             k,
             ar,
             device,
@@ -627,6 +783,9 @@ def run_fold(
             device=device,
             ablation=experiment.ablation,
             track_components=log_curves,
+            two_step=experiment.two_step,
+            temperature=experiment.temperature,
+            update=resolve_update(experiment),
         )
         train_ce = train_stats["hard_ce"]
         val_out = validate(
@@ -642,6 +801,7 @@ def run_fold(
         logger.add_scalar("Valid/CE Losses", val_loss, epoch + 1)
         if log_curves:
             logger.add_scalar("Train/Lambda", lam, epoch + 1)
+            logger.add_scalar("Train/Temperature", experiment.temperature, epoch + 1)
             if train_stats.get("soft_ce_l") is not None:
                 logger.add_scalar(
                     "Train/Soft CE Labeled", train_stats["soft_ce_l"], epoch + 1,
@@ -725,7 +885,9 @@ def run_experiment(
     print(f"Experiment: {experiment.name}  |  Dataset: {preset.dataset_name}")
     print(f"Teacher: {experiment.teacher or 'None'}  |  lambda: {experiment.lam}"
           f"  |  softlabels: {experiment.softlabels}"
-          f"  |  ablation: {experiment.ablation}")
+          f"  |  ablation: {experiment.ablation}"
+          f"  |  update: {resolve_update(experiment)}"
+          f"  |  temperature: {experiment.temperature}")
     print(f"Epochs: {epochs}  |  Device: {device}"
           f"  |  log_curves: {log_curves}"
           f"  |  eval_root: {eval_root}")
@@ -859,6 +1021,7 @@ def main_cli():
         epilog="""
 Examples:
   python new_evaluate.py --dataset hip --experiment ResNet18_ViTMAE_l1.0 --gpu 7
+  python new_evaluate.py --dataset hip --experiment ResNet18_ViTMAE_l1.0_T4 --gpu 0
   python new_evaluate.py --dataset hip --experiment ResNet18_MII_l1.0 --ar 0.5,0.6,0.7,0.8,0.9,1.0 --gpu 7
   python new_evaluate.py --dataset hip --experiment ResNet18_MII_l1.0 --gpu 7 --num-workers 2
   python new_evaluate.py --dataset hip --experiment ResNet18_ViTMAE_l1.0 --gpu 2,3

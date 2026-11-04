@@ -18,24 +18,12 @@ from lib.baselines.losses import (
     soft_ce_loss,
 )
 from lib.criterion import eps as CLS_EPS
+from lib.dataloader import paired_batches
 
 
 def _interleave_loaders(dloader_l, dloader_u):
     """Yield (l_batch, u_batch) pairs; stop when the shorter loader exhausts."""
-    if len(dloader_l.dataset) >= len(dloader_u.dataset):
-        outer, inner, outer_labeled = dloader_l, dloader_u, True
-    else:
-        outer, inner, outer_labeled = dloader_u, dloader_l, False
-    inner_iter = iter(inner)
-    for outer_batch in outer:
-        try:
-            inner_batch = next(inner_iter)
-        except StopIteration:
-            break
-        if outer_labeled:
-            yield outer_batch, inner_batch
-        else:
-            yield inner_batch, outer_batch
+    yield from paired_batches(dloader_l, dloader_u)
 
 
 def train_epoch_fixmatch(
@@ -163,16 +151,28 @@ def train_epoch_kd(
     num_classes: int,
     device: torch.device,
     two_step: bool = False,
+    split: str = "label",
 ) -> dict:
     """Temperature KD on L (+ U when available). Teacher is frozen.
 
-    ``two_step=False`` is the Hinton objective: one backward of
-    hard CE + λ KD, then one optimizer step.
+    ``two_step=False`` is the Hinton objective: one backward of hard CE + λ KD
+    on the labeled batch, then a separate KD step on the unlabeled batch.
 
-    ``two_step=True`` steps on the human-label loss first. The KD term is
-    then forwarded again, so it sees the updated weights, and stepped
-    separately. Unlabeled batches stay a single KD step in both modes.
+    ``two_step=True`` is two optimizer steps, chosen by ``split``:
+
+    ``split="label"`` groups by label type. Step 1 is hard CE on the labeled
+    batch. Step 2 is λ times the KD loss averaged over the labeled and
+    unlabeled batches together.
+
+    ``split="sample"`` groups by batch. The labeled batch gets hard CE + λ KD
+    in one backward. The unlabeled batch gets its own KD step.
+
+    Both splits are two updates. There is no third step that reapplies KD to
+    the labeled batch on its own and then again to the unlabeled batch.
     """
+    if two_step and split not in ("label", "sample"):
+        raise ValueError(f"KD split must be 'label' or 'sample', got {split!r}")
+    label_split = two_step and split == "label"
     model.train()
     teacher.eval()
     ce_total = 0.0
@@ -187,20 +187,12 @@ def train_epoch_kd(
             t_probs, _ = teacher(image)
         return kd_loss(logits, t_probs, temperature)
 
-    def _update_labeled(img: torch.Tensor, lbl: torch.Tensor) -> tuple[float, Optional[float]]:
+    def _sample_labeled(img: torch.Tensor, lbl: torch.Tensor) -> tuple[float, Optional[float]]:
+        """One step of hard CE + λ KD on a labeled batch."""
         optimizer.zero_grad()
         loss_ce, ce = hard_ce_loss(model, img, lbl, num_classes, device)
         kd_scalar = None
-        if two_step:
-            loss_ce.backward()
-            optimizer.step()
-            if lam > 0:
-                optimizer.zero_grad()
-                loss_kd = _kd_on_batch(img)
-                (lam * loss_kd).backward()
-                optimizer.step()
-                kd_scalar = float(loss_kd.item())
-        elif lam > 0:
+        if lam > 0:
             loss_kd = _kd_on_batch(img)
             (loss_ce + lam * loss_kd).backward()
             optimizer.step()
@@ -210,9 +202,34 @@ def train_epoch_kd(
             optimizer.step()
         return ce, kd_scalar
 
+    def _label_pair(img_l: torch.Tensor, lbl: torch.Tensor, img_u: Optional[torch.Tensor]) -> tuple[float, Optional[float]]:
+        """Hard step, then one KD step pooled over labeled and unlabeled."""
+        optimizer.zero_grad()
+        loss_ce, ce = hard_ce_loss(model, img_l, lbl, num_classes, device)
+        loss_ce.backward()
+        optimizer.step()
+        kd_scalar = None
+        if lam > 0:
+            optimizer.zero_grad()
+            loss_kd_l = _kd_on_batch(img_l)
+            if img_u is None:
+                loss_kd = loss_kd_l
+            else:
+                loss_kd_u = _kd_on_batch(img_u)
+                n_l = img_l.size(0)
+                n_u = img_u.size(0)
+                loss_kd = (loss_kd_l * n_l + loss_kd_u * n_u) / (n_l + n_u)
+            (lam * loss_kd).backward()
+            optimizer.step()
+            kd_scalar = float(loss_kd.item())
+        return ce, kd_scalar
+
     if dloader_u is None:
         for img, lbl, _ in dloader_l:
-            ce, kd_scalar = _update_labeled(img, lbl)
+            if label_split:
+                ce, kd_scalar = _label_pair(img, lbl, None)
+            else:
+                ce, kd_scalar = _sample_labeled(img, lbl)
             if kd_scalar is not None:
                 kd_total += kd_scalar
                 kd_n += 1
@@ -220,17 +237,20 @@ def train_epoch_kd(
             n += 1
     else:
         for l_batch, u_batch in _interleave_loaders(dloader_l, dloader_u):
-            ce, kd_l = _update_labeled(l_batch[0], l_batch[1])
-
-            # Unlabeled: KD only
-            if lam > 0:
-                optimizer.zero_grad()
-                loss_kd_u = _kd_on_batch(u_batch[0])
-                (lam * loss_kd_u).backward()
-                optimizer.step()
-                kd_total += float(kd_l) + float(loss_kd_u.item())
-                kd_n += 2
-
+            if label_split:
+                ce, kd_scalar = _label_pair(l_batch[0], l_batch[1], u_batch[0])
+                if kd_scalar is not None:
+                    kd_total += kd_scalar
+                    kd_n += 1
+            else:
+                ce, kd_l = _sample_labeled(l_batch[0], l_batch[1])
+                if lam > 0:
+                    optimizer.zero_grad()
+                    loss_kd_u = _kd_on_batch(u_batch[0])
+                    (lam * loss_kd_u).backward()
+                    optimizer.step()
+                    kd_total += float(kd_l) + float(loss_kd_u.item())
+                    kd_n += 2
             ce_total += ce
             n += 1
 

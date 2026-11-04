@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import inspect
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.sampler import SubsetRandomSampler
@@ -255,6 +256,84 @@ def get_ssl_labels(labels, annot_ratio, num_classes, label_indices=None):
     print(f"unlabeled: {len(label_indices_train_u)}, labeled: {len(label_indices_train_l)}" )
     return label_indices_train_u, label_indices_train_l
 
+def _persistent_worker_kwargs(num_workers: int) -> dict:
+    """Keep DataLoader workers alive across epochs when this PyTorch supports it.
+
+    Shutting the workers down after every epoch closes their result pipe while
+    they may still be sending a prefetched batch, which is the BrokenPipeError
+    in multiprocessing/queues.py _feed. persistent_workers (PyTorch >= 1.7)
+    skips that shutdown until the loader itself is destroyed.
+    """
+    if num_workers <= 0:
+        return {}
+    if "persistent_workers" not in inspect.signature(DataLoader.__init__).parameters:
+        return {}
+    return {"persistent_workers": True}
+
+
+class _CapBatches:
+    """Yield only the first ``n`` batches from an existing batch sampler."""
+
+    def __init__(self, batch_sampler, n_batches: int):
+        self.batch_sampler = batch_sampler
+        self.n_batches = n_batches
+
+    def __iter__(self):
+        for i, batch in enumerate(self.batch_sampler):
+            if i >= self.n_batches:
+                return
+            yield batch
+
+    def __len__(self):
+        return self.n_batches
+
+
+def _install_batch_cap(loader, n_batches: int):
+    """Point ``loader`` at a sampler of length ``n_batches``. Returns a restore fn.
+
+    A persistent iterator copies ``batch_sampler`` once, into ``_index_sampler``,
+    and replays that object on every later epoch. Both references have to move
+    together or the cap is ignored after the first pass.
+    """
+    previous = loader.batch_sampler
+    capped = _CapBatches(previous, n_batches)
+    loader.batch_sampler = capped
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is not None and hasattr(iterator, "_index_sampler"):
+        iterator._index_sampler = capped
+
+    def restore():
+        loader.batch_sampler = previous
+        live = getattr(loader, "_iterator", None)
+        if live is not None and hasattr(live, "_index_sampler"):
+            live._index_sampler = previous
+
+    return restore
+
+
+def paired_batches(loader_l, loader_u):
+    """Yield ``(labeled_batch, unlabeled_batch)`` until the shorter loader ends.
+
+    Stopping a ``for batch in loader`` early deletes that iterator while its
+    workers are still prefetching. On Python 3.8 those workers then raise
+    BrokenPipeError from ``multiprocessing/queues.py`` and the next epoch
+    stalls while they are killed and started again. Capping both samplers to
+    the same batch count lets each iterator run to a normal StopIteration,
+    which is the shutdown path PyTorch actually handles.
+    """
+    n_batches = min(len(loader_l), len(loader_u))
+    if n_batches == 0:
+        return
+    restore_l = _install_batch_cap(loader_l, n_batches)
+    restore_u = _install_batch_cap(loader_u, n_batches)
+    try:
+        for labeled, unlabeled in zip(loader_l, loader_u):
+            yield labeled, unlabeled
+    finally:
+        restore_l()
+        restore_u()
+
+
 def create_dataloaders(dataset_name, dataset_path, class_sizes=None, seed=0, train_ratio=0.7, valid_ratio=0.1, annot_ratio=0.5, batch_size=1, num_workers=1, num_output_channels=1, image_size=(224,224), k_folds=0, k_fold_index=None, keep_remainder=False):
     # parent function used to create dataloaders for train and test loops
     # supply PT config via... configparser? gotta learn initially though
@@ -284,28 +363,36 @@ def create_dataloaders(dataset_name, dataset_path, class_sizes=None, seed=0, tra
     train_transform = get_transform(train_dataset, 'train', hyperparams=hyperparams, image_size=image_size, PT_config=PT_config, num_output_channels=num_output_channels, normalize=True)
     test_transform = get_transform(test_dataset, 'test', hyperparams=hyperparams, image_size=image_size, PT_config=PT_config, num_output_channels=num_output_channels, normalize=True)  
     #valid_indices = valid_dataset.indices
+    loader_kwargs = dict(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+        **_persistent_worker_kwargs(num_workers),
+    )
     valid_custom_dataset = PatientDataset(valid_dataset, test_transform, dataset_type=dataset_name)
-    valid_dloader = DataLoader(valid_custom_dataset, shuffle=False, batch_size=batch_size, num_workers=num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+    valid_dloader = DataLoader(valid_custom_dataset, shuffle=False, **loader_kwargs)
     #test_indices = test_dataset.indices
     test_custom_dataset = PatientDataset(test_dataset, test_transform, dataset_type=dataset_name)
-    test_dloader = DataLoader(test_custom_dataset, shuffle=False, batch_size=batch_size, num_workers=num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+    test_dloader = DataLoader(test_custom_dataset, shuffle=False, **loader_kwargs)
 
     if not ssl:
         train_custom_dataset = PatientDataset(train_dataset, train_transform, dataset_type=dataset_name)
-        train_dloader = DataLoader(train_custom_dataset, shuffle=True, batch_size=batch_size, num_workers=num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+        train_dloader = DataLoader(train_custom_dataset, shuffle=True, **loader_kwargs)
         if keep_remainder:
             train_plus_custom_dataset = PatientDataset(train_plus_dataset, train_transform, dataset_type=dataset_name)
-            train_plus_dloader = DataLoader(train_plus_custom_dataset, shuffle=True, batch_size=batch_size, num_workers=num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+            train_plus_dloader = DataLoader(train_plus_custom_dataset, shuffle=True, **loader_kwargs)
             return train_dloader, valid_dloader, test_dloader, train_plus_dloader
         else: return train_dloader, valid_dloader, test_dloader
     else:
         train_u_dataset, train_l_dataset = split_by_patient(train_dataset.dataset, class_sizes=None, train_ratio=annot_ratio, valid_ratio=0.0, keep_train=False, all_patients=train_patients, k_folds=0, k_fold_index=None, ssl=ssl)
         print(f"ssl split: unlabeled = {len(train_u_dataset)}, labeled = {len(train_l_dataset)}")
         train_dataset_u = PatientDataset(train_u_dataset, train_transform, dataset_type=dataset_name)
-        train_dloader_u = DataLoader(train_dataset_u, shuffle=True, batch_size=batch_size, num_workers=num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+        train_dloader_u = DataLoader(train_dataset_u, shuffle=True, **loader_kwargs)
         # labeled dataset remains the same
         train_dataset_l = PatientDataset(train_l_dataset, train_transform, dataset_type=dataset_name)
-        train_dloader_l = DataLoader(train_dataset_l, shuffle=True, batch_size=batch_size, num_workers=num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+        train_dloader_l = DataLoader(train_dataset_l, shuffle=True, **loader_kwargs)
         return train_dloader_u, train_dloader_l, valid_dloader, test_dloader
 
 def get_PT_config(dataset_name, tr, vr, s, k):

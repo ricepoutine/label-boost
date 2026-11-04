@@ -7,7 +7,8 @@ Four method families (Arm A = no large teacher; Arm B = same frozen teacher):
   MeanTeacher                     (A)  EMA teacher, MSE consistency
   MetaPseudoLabels                (A)  co-trained ResNet18 teacher (soft MPL)
   KD_ViTMAE_T4 / KD_MII_T4        (B)  classical Hinton KD (T=4), one combined step
-  KD_*_T4_2step                   (B)  same KD loss, human label and KD stepped separately
+  KD_*_T4_2step                   (B)  T=4, label-type split: hard step, then pooled KD
+  KD_*_T1_2step                   (B)  T=1, same label-type split
 
 Fair-comparison protocol (matched to evaluate.py / Label-Boost):
   - Same ResNet18 student (from scratch), AdamW lr=1e-3 / wd=1e-4, 300 epochs
@@ -109,8 +110,11 @@ class Experiment:
     ema_decay: float = EMA_DECAY
     # Experiment directory used to locate teacher probes (KD fair reuse)
     probe_experiment: Optional[str] = None
-    # KD only: step on the human label, then step again on the KD term
+    # KD only. False: hard+KD on the labeled batch, then KD on unlabeled.
+    # True: two updates of ``split``. "label" pools KD over both batches.
+    # "sample" keeps KD with the hard loss on labeled data.
     two_step: bool = False
+    split: str = "label"
 
 
 EXPERIMENTS: dict[str, Experiment] = {
@@ -139,6 +143,7 @@ EXPERIMENTS: dict[str, Experiment] = {
         temperature=KD_TEMPERATURE,
         probe_experiment="ResNet18_ViTMAE_l1.0",
         two_step=True,
+        split="label",
     ),
     "KD_MII_T4_2step": Experiment(
         "KD_MII_T4_2step",
@@ -147,6 +152,63 @@ EXPERIMENTS: dict[str, Experiment] = {
         temperature=KD_TEMPERATURE,
         probe_experiment="ResNet18_MII_l1.0",
         two_step=True,
+        split="label",
+    ),
+    # Label-type split at T=1. Same two updates as label-boost two-step.
+    "KD_ViTMAE_T1_2step": Experiment(
+        "KD_ViTMAE_T1_2step",
+        method="kd",
+        teacher="ViTMAE",
+        temperature=1.0,
+        probe_experiment="ResNet18_ViTMAE_l1.0",
+        two_step=True,
+        split="label",
+    ),
+    "KD_MII_T1_2step": Experiment(
+        "KD_MII_T1_2step",
+        method="kd",
+        teacher="MII",
+        temperature=1.0,
+        probe_experiment="ResNet18_MII_l1.0",
+        two_step=True,
+        split="label",
+    ),
+    # Sample-type split: hard+KD on the labeled batch, then KD on unlabeled.
+    "KD_ViTMAE_T4_2step_sample": Experiment(
+        "KD_ViTMAE_T4_2step_sample",
+        method="kd",
+        teacher="ViTMAE",
+        temperature=KD_TEMPERATURE,
+        probe_experiment="ResNet18_ViTMAE_l1.0",
+        two_step=True,
+        split="sample",
+    ),
+    "KD_MII_T4_2step_sample": Experiment(
+        "KD_MII_T4_2step_sample",
+        method="kd",
+        teacher="MII",
+        temperature=KD_TEMPERATURE,
+        probe_experiment="ResNet18_MII_l1.0",
+        two_step=True,
+        split="sample",
+    ),
+    "KD_ViTMAE_T1_2step_sample": Experiment(
+        "KD_ViTMAE_T1_2step_sample",
+        method="kd",
+        teacher="ViTMAE",
+        temperature=1.0,
+        probe_experiment="ResNet18_ViTMAE_l1.0",
+        two_step=True,
+        split="sample",
+    ),
+    "KD_MII_T1_2step_sample": Experiment(
+        "KD_MII_T1_2step_sample",
+        method="kd",
+        teacher="MII",
+        temperature=1.0,
+        probe_experiment="ResNet18_MII_l1.0",
+        two_step=True,
+        split="sample",
     ),
 }
 
@@ -284,6 +346,7 @@ def run_fold(
                 lam=lam, temperature=experiment.temperature,
                 num_classes=NUM_CLASSES, device=device,
                 two_step=experiment.two_step,
+                split=experiment.split,
             )
         elif experiment.method == "mpl":
             assert mpl_teacher is not None and opt_t is not None
