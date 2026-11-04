@@ -162,8 +162,17 @@ def train_epoch_kd(
     temperature: float,
     num_classes: int,
     device: torch.device,
+    two_step: bool = False,
 ) -> dict:
-    """Standard temperature KD on L (+ U when available). Teacher is frozen."""
+    """Temperature KD on L (+ U when available). Teacher is frozen.
+
+    ``two_step=False`` is the Hinton objective: one backward of
+    hard CE + λ KD, then one optimizer step.
+
+    ``two_step=True`` steps on the human-label loss first. The KD term is
+    then forwarded again, so it sees the updated weights, and stepped
+    separately. Unlabeled batches stay a single KD step in both modes.
+    """
     model.train()
     teacher.eval()
     ce_total = 0.0
@@ -178,31 +187,40 @@ def train_epoch_kd(
             t_probs, _ = teacher(image)
         return kd_loss(logits, t_probs, temperature)
 
+    def _update_labeled(img: torch.Tensor, lbl: torch.Tensor) -> tuple[float, Optional[float]]:
+        optimizer.zero_grad()
+        loss_ce, ce = hard_ce_loss(model, img, lbl, num_classes, device)
+        kd_scalar = None
+        if two_step:
+            loss_ce.backward()
+            optimizer.step()
+            if lam > 0:
+                optimizer.zero_grad()
+                loss_kd = _kd_on_batch(img)
+                (lam * loss_kd).backward()
+                optimizer.step()
+                kd_scalar = float(loss_kd.item())
+        elif lam > 0:
+            loss_kd = _kd_on_batch(img)
+            (loss_ce + lam * loss_kd).backward()
+            optimizer.step()
+            kd_scalar = float(loss_kd.item())
+        else:
+            loss_ce.backward()
+            optimizer.step()
+        return ce, kd_scalar
+
     if dloader_u is None:
         for img, lbl, _ in dloader_l:
-            optimizer.zero_grad()
-            loss_ce, ce = hard_ce_loss(model, img, lbl, num_classes, device)
-            if lam > 0:
-                loss_kd = _kd_on_batch(img)
-                (loss_ce + lam * loss_kd).backward()
-                kd_total += float(loss_kd.item())
+            ce, kd_scalar = _update_labeled(img, lbl)
+            if kd_scalar is not None:
+                kd_total += kd_scalar
                 kd_n += 1
-            else:
-                loss_ce.backward()
-            optimizer.step()
             ce_total += ce
             n += 1
     else:
         for l_batch, u_batch in _interleave_loaders(dloader_l, dloader_u):
-            # Labeled: CE + KD
-            optimizer.zero_grad()
-            loss_ce, ce = hard_ce_loss(model, l_batch[0], l_batch[1], num_classes, device)
-            if lam > 0:
-                loss_kd_l = _kd_on_batch(l_batch[0])
-                (loss_ce + lam * loss_kd_l).backward()
-            else:
-                loss_ce.backward()
-            optimizer.step()
+            ce, kd_l = _update_labeled(l_batch[0], l_batch[1])
 
             # Unlabeled: KD only
             if lam > 0:
@@ -210,7 +228,7 @@ def train_epoch_kd(
                 loss_kd_u = _kd_on_batch(u_batch[0])
                 (lam * loss_kd_u).backward()
                 optimizer.step()
-                kd_total += float(loss_kd_l.item()) + float(loss_kd_u.item())
+                kd_total += float(kd_l) + float(loss_kd_u.item())
                 kd_n += 2
 
             ce_total += ce

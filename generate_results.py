@@ -631,8 +631,13 @@ def _add_dca_reference(ax, y_true: np.ndarray,
 def plot_calibration_grid(
     eval_root: str, dataset: str, experiments: list[str],
     out_path: Path, ars: list[float] = ARS,
+    eval_roots: Optional[dict[str, str]] = None,
 ) -> None:
-    """Calibration grid (one panel per AR), comparing the experiments overlaid."""
+    """Calibration grid (one panel per AR), comparing the experiments overlaid.
+
+    ``eval_roots`` optionally maps an experiment name to a different eval root
+    (for example a baseline that lives outside ``eval_root``).
+    """
     n = len(ars)
     cols = min(5, n)
     rows = math.ceil(n / cols)
@@ -646,7 +651,8 @@ def plot_calibration_grid(
         ax = axes[idx // cols][idx % cols]
         any_drawn = False
         for exp in experiments:
-            data = load_pooled_predictions(eval_root, dataset, exp, ar)
+            root = (eval_roots or {}).get(exp, eval_root)
+            data = load_pooled_predictions(root, dataset, exp, ar)
             if data is None:
                 continue
             y_true, y_prob = data
@@ -687,6 +693,7 @@ def plot_calibration_grid(
 def plot_dca_grid(
     eval_root: str, dataset: str, experiments: list[str],
     out_path: Path, ars: list[float] = ARS,
+    eval_roots: Optional[dict[str, str]] = None,
 ) -> None:
     n = len(ars)
     cols = min(5, n)
@@ -702,7 +709,8 @@ def plot_dca_grid(
         y_true_for_ref = np.array([])
         any_drawn = False
         for exp in experiments:
-            data = load_pooled_predictions(eval_root, dataset, exp, ar)
+            root = (eval_roots or {}).get(exp, eval_root)
+            data = load_pooled_predictions(root, dataset, exp, ar)
             if data is None:
                 continue
             y_true, y_prob = data
@@ -814,18 +822,24 @@ def run_pseudolabels(
 
 def run_calibration_grid(
     eval_root: str, dataset: str, fig_root: Path,
-    experiments: tuple[str, str] = ("ResNet18", "ResNet18_MII_l1.0"),
+    experiments: tuple[str, ...] = ("ResNet18", "ResNet18_MII_l1.0"),
+    eval_roots: Optional[dict[str, str]] = None,
 ) -> None:
     out_path = fig_dataset_dir(fig_root, dataset) / "calibration_mii_vs_baseline_grid.png"
-    plot_calibration_grid(eval_root, dataset, list(experiments), out_path)
+    plot_calibration_grid(
+        eval_root, dataset, list(experiments), out_path, eval_roots=eval_roots,
+    )
 
 
 def run_dca_grid(
     eval_root: str, dataset: str, fig_root: Path,
-    experiments: tuple[str, str] = ("ResNet18", "ResNet18_MII_l1.0"),
+    experiments: tuple[str, ...] = ("ResNet18", "ResNet18_MII_l1.0"),
+    eval_roots: Optional[dict[str, str]] = None,
 ) -> None:
     out_path = fig_dataset_dir(fig_root, dataset) / "dca_mii_vs_baseline_grid.png"
-    plot_dca_grid(eval_root, dataset, list(experiments), out_path)
+    plot_dca_grid(
+        eval_root, dataset, list(experiments), out_path, eval_roots=eval_roots,
+    )
 
 
 def run_umap(fig_root: Path, dataset: str = "hip", k: int = 0, ar: float = 1.0,

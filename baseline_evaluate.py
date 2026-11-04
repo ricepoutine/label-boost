@@ -6,7 +6,8 @@ Four method families (Arm A = no large teacher; Arm B = same frozen teacher):
   FixMatch_hard / FixMatch_soft   (A)  student self-PL, weak→strong, confidence τ
   MeanTeacher                     (A)  EMA teacher, MSE consistency
   MetaPseudoLabels                (A)  co-trained ResNet18 teacher (soft MPL)
-  KD_ViTMAE_T4 / KD_MII_T4        (B)  classical Hinton KD (T=4) with Label-Boost teachers
+  KD_ViTMAE_T4 / KD_MII_T4        (B)  classical Hinton KD (T=4), one combined step
+  KD_*_T4_2step                   (B)  same KD loss, human label and KD stepped separately
 
 Fair-comparison protocol (matched to evaluate.py / Label-Boost):
   - Same ResNet18 student (from scratch), AdamW lr=1e-3 / wd=1e-4, 300 epochs
@@ -108,6 +109,8 @@ class Experiment:
     ema_decay: float = EMA_DECAY
     # Experiment directory used to locate teacher probes (KD fair reuse)
     probe_experiment: Optional[str] = None
+    # KD only: step on the human label, then step again on the KD term
+    two_step: bool = False
 
 
 EXPERIMENTS: dict[str, Experiment] = {
@@ -128,6 +131,22 @@ EXPERIMENTS: dict[str, Experiment] = {
         teacher="MII",
         temperature=KD_TEMPERATURE,
         probe_experiment="ResNet18_MII_l1.0",
+    ),
+    "KD_ViTMAE_T4_2step": Experiment(
+        "KD_ViTMAE_T4_2step",
+        method="kd",
+        teacher="ViTMAE",
+        temperature=KD_TEMPERATURE,
+        probe_experiment="ResNet18_ViTMAE_l1.0",
+        two_step=True,
+    ),
+    "KD_MII_T4_2step": Experiment(
+        "KD_MII_T4_2step",
+        method="kd",
+        teacher="MII",
+        temperature=KD_TEMPERATURE,
+        probe_experiment="ResNet18_MII_l1.0",
+        two_step=True,
     ),
 }
 
@@ -264,6 +283,7 @@ def run_fold(
                 model, frozen_teacher, optimizer, dloader_l, dloader_u,
                 lam=lam, temperature=experiment.temperature,
                 num_classes=NUM_CLASSES, device=device,
+                two_step=experiment.two_step,
             )
         elif experiment.method == "mpl":
             assert mpl_teacher is not None and opt_t is not None

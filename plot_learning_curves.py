@@ -1,14 +1,21 @@
 """
 plot_learning_curves.py - Val CE learning curves from existing TensorBoard logs.
 
-Compares sample-type (medivision eval_output) vs label-type (label-boost
-eval_output) using the already-logged ``Valid/CE Losses`` scalar.
+Compares sample-type (``evaluate.py`` → ``curves_sample_type_output/``) vs
+label-type (``new_evaluate.py`` → ``curves_eval_output/``) using the
+already-logged ``Valid/CE Losses`` scalar.
 
-Writes under::
+Writes comparison plots under::
 
     figures/{hip,covid}/learning_curves/
         val_ce_{experiment}_ar{ar}.png
-        val_ce_grid_ar{ar}.png   (all_l1 experiments side-by-side)
+        val_ce_grid_ar{ar}.png
+
+Label-type-only curves (from ``curves_eval_output/``) under::
+
+    learning_curves_label_type/{hip,covid}/
+        val_ce_{experiment}_ar{ar}.png
+        val_ce_grid_ar{ar}.png
 
 Examples::
 
@@ -41,10 +48,11 @@ DISPLAY_NAMES: dict[str, str] = {
 }
 
 DEFAULT_EXPERIMENTS = [
-    "ResNet18",
     "ResNet18_ViTMAE_l1.0",
     "ResNet18_MII_l1.0",
 ]
+
+REPO_ROOT = Path(__file__).resolve().parent
 
 FIG_DIR_BY_DATASET = {
     "hip734_cropped": "hip",
@@ -134,6 +142,29 @@ def aggregate_curves(
     return steps, mean, stderr
 
 
+def plot_single(
+    agg: tuple[np.ndarray, np.ndarray, np.ndarray],
+    title: str,
+    out_path: Path,
+    label: str = "Label-type",
+    color: str = "#d62728",
+    ylabel: str = "Validation CE",
+):
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    steps, mean, stderr = agg
+    ax.plot(steps, mean, label=label, color=color, linewidth=1.8)
+    ax.fill_between(steps, mean - stderr, mean + stderr, color=color, alpha=0.2)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend(frameon=False)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
 def plot_comparison(
     sample_agg: tuple[np.ndarray, np.ndarray, np.ndarray],
     label_agg: tuple[np.ndarray, np.ndarray, np.ndarray],
@@ -143,8 +174,8 @@ def plot_comparison(
 ):
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
     for agg, name, color in (
-        (sample_agg, "Sample-type (medivision)", "#1f77b4"),
-        (label_agg, "Label-type (label-boost)", "#d62728"),
+        (sample_agg, "Sample-type (evaluate.py)", "#1f77b4"),
+        (label_agg, "Label-type (new_evaluate.py)", "#d62728"),
     ):
         steps, mean, stderr = agg
         ax.plot(steps, mean, label=name, color=color, linewidth=1.8)
@@ -155,6 +186,33 @@ def plot_comparison(
     ax.set_title(title)
     ax.legend(frameon=False)
     ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_single_grid(
+    panels: list[tuple[str, tuple[np.ndarray, np.ndarray, np.ndarray]]],
+    title: str,
+    out_path: Path,
+    label: str = "Label-type",
+    color: str = "#d62728",
+):
+    n = len(panels)
+    fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 3.8), sharey=False)
+    if n == 1:
+        axes = [axes]
+    for ax, (name, agg) in zip(axes, panels):
+        st, m, se = agg
+        ax.plot(st, m, label=label, color=color, linewidth=1.6)
+        ax.fill_between(st, m - se, m + se, color=color, alpha=0.2)
+        ax.set_title(name, fontsize=10)
+        ax.set_xlabel("Epoch")
+        ax.grid(True, alpha=0.3)
+    axes[0].set_ylabel("Validation CE")
+    axes[0].legend(frameon=False, fontsize=8)
+    fig.suptitle(title, fontsize=12)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=160)
@@ -204,18 +262,23 @@ def main():
     )
     parser.add_argument(
         "--label-root",
-        default="/Users/ricepoutine/Documents/repos.nosync/label-boost/eval_output",
-        help="Label-type TB root (label-boost eval_output)",
+        default=str(REPO_ROOT / "curves_eval_output"),
+        help="Label-type TB root (new_evaluate.py curves_eval_output)",
     )
     parser.add_argument(
         "--sample-root",
-        default="/Users/ricepoutine/Documents/repos.nosync/medivision/eval_output",
-        help="Sample-type TB root (medivision eval_output)",
+        default=str(REPO_ROOT / "curves_sample_type_output"),
+        help="Sample-type TB root (evaluate.py curves_sample_type_output)",
     )
     parser.add_argument(
         "--fig-root",
-        default="/Users/ricepoutine/Documents/repos.nosync/label-boost/figures",
-        help="Figures root (default: label-boost/figures)",
+        default=str(REPO_ROOT / "figures"),
+        help="Comparison figures root (sample vs label)",
+    )
+    parser.add_argument(
+        "--label-fig-root",
+        default=str(REPO_ROOT / "learning_curves_label_type"),
+        help="Label-type-only learning-curve root (curves_eval_output)",
     )
     parser.add_argument(
         "--tag", default=VAL_TAG,
@@ -225,6 +288,7 @@ def main():
 
     dataset = DATASET_NAME[args.dataset]
     fig_dir = Path(args.fig_root) / FIG_DIR_BY_DATASET[args.dataset] / "learning_curves"
+    label_fig_dir = Path(args.label_fig_root) / FIG_DIR_BY_DATASET[args.dataset]
     ar_list = parse_ar_list(args.ar)
     experiments = [e.strip() for e in args.experiments.split(",") if e.strip()]
     label_root = Path(args.label_root)
@@ -233,11 +297,13 @@ def main():
     print(f"Dataset: {dataset}")
     print(f"Label-type root:  {label_root}")
     print(f"Sample-type root: {sample_root}")
-    print(f"Output: {fig_dir}")
+    print(f"Comparison output: {fig_dir}")
+    print(f"Label-type output: {label_fig_dir}")
     print(f"Tag: {args.tag}")
 
     for ar in ar_list:
         grid_panels = []
+        label_grid_panels = []
         for exp in experiments:
             sample_curves = load_fold_curves(sample_root, dataset, exp, ar, args.tag)
             label_curves = load_fold_curves(label_root, dataset, exp, ar, args.tag)
@@ -251,19 +317,31 @@ def main():
             )
             if sample_agg is None or label_agg is None:
                 print(
-                    f"    skip (sample={sample_agg is not None}, "
+                    f"    skip comparison (sample={sample_agg is not None}, "
                     f"label={label_agg is not None})"
                 )
-                continue
+            else:
+                out = fig_dir / f"val_ce_{exp}_ar{ar}.png"
+                plot_comparison(
+                    sample_agg, label_agg,
+                    title=f"{display}  |  ar={ar}",
+                    out_path=out,
+                )
+                print(f"    wrote comparison {out}")
+                grid_panels.append((display, sample_agg, label_agg))
 
-            out = fig_dir / f"val_ce_{exp}_ar{ar}.png"
-            plot_comparison(
-                sample_agg, label_agg,
-                title=f"{display}  |  ar={ar}",
-                out_path=out,
-            )
-            print(f"    wrote {out}")
-            grid_panels.append((display, sample_agg, label_agg))
+            if label_agg is not None:
+                label_out = label_fig_dir / f"val_ce_{exp}_ar{ar}.png"
+                plot_single(
+                    label_agg,
+                    title=f"{display}  |  ar={ar}",
+                    out_path=label_out,
+                    label="Label-type (new_evaluate.py)",
+                )
+                print(f"    wrote label-type {label_out}")
+                label_grid_panels.append((display, label_agg))
+            else:
+                print("    skip label-type (no curves)")
 
         if grid_panels:
             grid_out = fig_dir / f"val_ce_grid_ar{ar}.png"
@@ -272,7 +350,17 @@ def main():
                 title=f"Validation CE learning curves  |  {dataset}  |  ar={ar}",
                 out_path=grid_out,
             )
-            print(f"  wrote grid {grid_out}")
+            print(f"  wrote comparison grid {grid_out}")
+
+        if label_grid_panels:
+            label_grid_out = label_fig_dir / f"val_ce_grid_ar{ar}.png"
+            plot_single_grid(
+                label_grid_panels,
+                title=f"Label-type validation CE  |  {dataset}  |  ar={ar}",
+                out_path=label_grid_out,
+                label="Label-type (new_evaluate.py)",
+            )
+            print(f"  wrote label-type grid {label_grid_out}")
 
     print("Done.")
 
