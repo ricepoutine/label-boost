@@ -18,12 +18,24 @@ from lib.baselines.losses import (
     soft_ce_loss,
 )
 from lib.criterion import eps as CLS_EPS
-from lib.dataloader import paired_batches
 
 
 def _interleave_loaders(dloader_l, dloader_u):
     """Yield (l_batch, u_batch) pairs; stop when the shorter loader exhausts."""
-    yield from paired_batches(dloader_l, dloader_u)
+    if len(dloader_l.dataset) >= len(dloader_u.dataset):
+        outer, inner, outer_labeled = dloader_l, dloader_u, True
+    else:
+        outer, inner, outer_labeled = dloader_u, dloader_l, False
+    inner_iter = iter(inner)
+    for outer_batch in outer:
+        try:
+            inner_batch = next(inner_iter)
+        except StopIteration:
+            break
+        if outer_labeled:
+            yield outer_batch, inner_batch
+        else:
+            yield inner_batch, outer_batch
 
 
 def train_epoch_fixmatch(

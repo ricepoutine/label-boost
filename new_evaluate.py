@@ -62,7 +62,7 @@ from torchmetrics.classification import BinaryAUROC
 from torch.utils.tensorboard import SummaryWriter
 from lib.baselines.losses import kd_loss
 from lib.criterion import ClsCriterion, eps as CLS_EPS
-from lib.dataloader import create_dataloaders, paired_batches
+from lib.dataloader import create_dataloaders
 from lib.utils.model_utils import save_checkpoint, alpha_schedule
 from models.resnet import CustomResNet
 from models.vitmae import CustomViTMAE
@@ -485,8 +485,22 @@ def train_epoch(model, optimizer, criterion, dloader_l, dloader_u,
             ce_total += ce
             n += 1
     else:
-        # ar < 1.0: one labeled batch paired with one unlabeled batch.
-        for l_batch, u_batch in paired_batches(dloader_l, dloader_u):
+        # ar < 1.0: interleaved labeled + unlabeled (same pairing as evaluate.py).
+        if len(dloader_l.dataset) >= len(dloader_u.dataset):
+            outer, inner, outer_labeled = dloader_l, dloader_u, True
+        else:
+            outer, inner, outer_labeled = dloader_u, dloader_l, False
+
+        inner_iter = iter(inner)
+        for outer_batch in outer:
+            try:
+                inner_batch = next(inner_iter)
+            except StopIteration:
+                break
+
+            l_batch = outer_batch if outer_labeled else inner_batch
+            u_batch = inner_batch if outer_labeled else outer_batch
+
             if update == "label_one":
                 # One backward of the label-type objective.
                 optimizer.zero_grad()
